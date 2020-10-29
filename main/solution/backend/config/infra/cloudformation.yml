@@ -371,6 +371,7 @@ Resources:
                 - !GetAtt [AccountsDb, Arn]
                 - !GetAtt [KeyPairsDb, Arn]
                 - !Join ['', [!GetAtt [KeyPairsDb, Arn], '/index/*']]
+                - !GetAtt [StorageGatewayDb, Arn]
 
         - PolicyName: param-store-access
           PolicyDocument:
@@ -378,7 +379,25 @@ Resources:
               Effect: Allow
               Action:
                 - ssm:GetParameter
-              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${self:custom.settings.paramStoreRoot}/*'
+              Resource:
+                - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${self:custom.settings.paramStoreRoot}/*'
+                - !Sub 'arn:aws:ssm:${AWS::Region}:*:parameter/aws/service/storagegateway/ami/FILE_S3/latest'
+
+        - PolicyName: storage-gateway-access
+          PolicyDocument:
+            Statement:
+              Effect: Allow
+              Action:
+                - storagegateway:CreateNFSFileShare
+              Resource: '*'
+
+        - PolicyName: iam-pass-role
+          PolicyDocument:
+            Statement:
+              Effect: Allow
+              Action:
+                - iam:PassRole
+              Resource: '*'
 
         - PolicyName: step-functions-invocation
           PolicyDocument:
@@ -548,16 +567,23 @@ Resources:
                 - !GetAtt [IndexesDb, Arn]
                 - !GetAtt [CostApiCachesDb, Arn]
                 - !GetAtt [UserRolesDb, Arn]
+                - !GetAtt [StorageGatewayDb, Arn]
 
         - PolicyName: param-store-access
           PolicyDocument:
             Statement:
-              Effect: Allow
-              Action:
-                - ssm:GetParameter
-                - ssm:PutParameter
-                - ssm:DeleteParameter
-              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${self:custom.settings.paramStoreRoot}/*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${self:custom.settings.paramStoreRoot}/*'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:*:parameter/aws/service/storagegateway/ami/FILE_S3/latest'
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${self:custom.settings.paramStoreRoot}/*'
 
         - PolicyName: dns-record-access
           PolicyDocument:
@@ -572,10 +598,18 @@ Resources:
             Statement:
               - Effect: 'Allow'
                 Action:
-                  - ec2:CreateKeyPair
-                  - ec2:DeleteKeyPair
-                  - ec2:ModifyImageAttribute
-                  - ec2:DescribeImages
+                  - ec2:*
+                Resource: '*'
+
+        - PolicyName: storage-gateway
+          PolicyDocument:
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - storagegateway:ActivateGateway
+                  - storagegateway:ListLocalDisks
+                  - storagegateway:AddCache
+                  - storagegateway:DeleteGateway
                 Resource: '*'
 
         - PolicyName: study-s3-policy-update
@@ -1174,6 +1208,7 @@ Resources:
 
   EnvironmentsDb:
     Type: AWS::DynamoDB::Table
+    DependsOn: AccountsDb
     Properties:
       TableName: ${self:custom.settings.dbEnvironments}
       AttributeDefinitions:
@@ -1199,6 +1234,7 @@ Resources:
 
   EnvironmentsTypesDb:
     Type: AWS::DynamoDB::Table
+    DependsOn: UserRolesDb
     Properties:
       TableName: ${self:custom.settings.dbEnvironmentTypes}
       AttributeDefinitions:
@@ -1318,6 +1354,19 @@ Resources:
             ProjectionType: 'ALL'
       BillingMode: PAY_PER_REQUEST
 
+  StorageGatewayDb:
+    Type: AWS::DynamoDB::Table
+    DependsOn: StudiesDb
+    Properties:
+      TableName: ${self:custom.settings.dbStorageGateway}
+      AttributeDefinitions:
+        - AttributeName: 'id'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'id'
+          KeyType: 'HASH'
+      BillingMode: PAY_PER_REQUEST
+
   # =============================================================================================
   # DEPRECATED -- Dynamo DB
   # =============================================================================================
@@ -1423,6 +1472,7 @@ Resources:
 
   DbStudies:
     Type: AWS::DynamoDB::Table
+    DependsOn: DbLocks
     Properties:
       TableName: ${self:custom.settings.dbTableStudies}
       AttributeDefinitions:
@@ -1476,6 +1526,7 @@ Resources:
 
   DbWorkflows:
     Type: AWS::DynamoDB::Table
+    DependsOn: DbWorkflowInstances
     Properties:
       TableName: ${self:custom.settings.dbTableWorkflows}
       AttributeDefinitions:
@@ -1513,6 +1564,7 @@ Resources:
 
   DbWorkflowDrafts:
     Type: AWS::DynamoDB::Table
+    DependsOn: DbWorkflowTemplates
     Properties:
       TableName: ${self:custom.settings.dbTableWorkflowDrafts}
       AttributeDefinitions:
