@@ -12,7 +12,7 @@
  *  express or implied. See the License for the specific language governing
  *  permissions and limitations under the License.
  */
-
+const _ = require('lodash');
 const ServicesContainer = require('@aws-ee/base-services-container/lib/services-container');
 
 const JsonSchemaValidationService = require('@aws-ee/base-services/lib/json-schema-validation-service');
@@ -48,6 +48,9 @@ describe('EnvironmentMountService', () => {
   let service = null;
   let environmentScService = null;
   let iamService = null;
+  let studyService = null;
+  let studyPermissionService = null;
+  let aws = null;
 
   beforeEach(async () => {
     // Initialize services container and register dependencies
@@ -69,6 +72,106 @@ describe('EnvironmentMountService', () => {
     service = await container.find('environmentMountService');
     environmentScService = await container.find('environmentScService');
     iamService = await container.find('iamService');
+    studyService = await container.find('studyService');
+    studyPermissionService = await container.find('studyPermissionService');
+    aws = await container.find('aws');
+  });
+
+  describe('Get study access info', () => {
+    it('should return s3Mounts with correct attributes', async () => {
+      // BUILD
+      const uid = 'u-currentUserId';
+      const requestContext = { principalIdentifier: { uid } };
+      const orgStudyId = 's1-org';
+      const myStudyId = 's2-my_study';
+      const openDataStudyId = 's3-open_data';
+      const studyIds = [orgStudyId, myStudyId, openDataStudyId];
+      const bucket = '123456789012-some-bucket-for-studydata';
+      const prefix = 'studies/some/prefix';
+      const kmsKeyArn = 'arn:aws:kms:some-region:12345678901:key/some-key-id';
+
+      service._settings = {
+        get: settingName => {
+          if (settingName === 'studyDataKmsKeyArn') {
+            return kmsKeyArn;
+          }
+          return undefined;
+        },
+      };
+
+      studyService.mustFind = (rc, studyId) => {
+        const category = {
+          open_data: 'Open Data',
+          org: 'Organization',
+          my_study: 'My Studies',
+        }[_.split(studyId, '-')[1]];
+        return Promise.resolve({
+          id: studyId,
+          name: `${studyId}-name`,
+          category,
+          resources: [{ arn: `arn:aws:s3:::${bucket}/${prefix}/${studyId}/` }],
+        });
+      };
+      studyPermissionService.getRequestorPermissions = () =>
+        Promise.resolve({
+          adminAccess: studyIds,
+          readonlyAccess: studyIds,
+          writeonlyAccess: [],
+          readwriteAccess: studyIds,
+        });
+      studyPermissionService.findByUser = () =>
+        Promise.resolve({
+          adminAccess: studyIds,
+          createdAt: new Date().toISOString(),
+          id: `User:${uid}`,
+          readonlyAccess: studyIds,
+          recordType: 'user',
+          uid,
+          updatedAt: new Date().toISOString(),
+        });
+      studyService.getAllowedStudies = permissions => {
+        const adminAccess = permissions.adminAccess || [];
+        const readonlyAccess = permissions.readonlyAccess || [];
+        const readwriteAccess = permissions.readwriteAccess || [];
+        return _.uniq([...adminAccess, ...readonlyAccess, ...readwriteAccess]);
+      };
+
+      aws.sdk = {
+        KMS: jest.fn().mockImplementation(() => {
+          return {
+            describeKey: () => ({
+              promise: () => Promise.resolve({ KeyMetadata: { Arn: kmsKeyArn } }),
+            }),
+          };
+        }),
+      };
+
+      // OPERATE
+      const studyAccessInfo = await service.getStudyAccessInfo(requestContext, studyIds);
+
+      // CHECK
+      expect(studyAccessInfo).toBeDefined();
+      expect(studyAccessInfo.s3Mounts).toBeDefined();
+
+      const s3Mounts = JSON.parse(studyAccessInfo.s3Mounts);
+      expect(s3Mounts[0].id).toEqual(orgStudyId);
+      expect(s3Mounts[0].bucket).toEqual(bucket);
+      expect(s3Mounts[0].prefix).toEqual(`${prefix}/${orgStudyId}/`);
+      expect(s3Mounts[0].writeable).toEqual(false);
+      expect(s3Mounts[0].kmsKeyId).toEqual(kmsKeyArn);
+
+      expect(s3Mounts[1].id).toEqual(myStudyId);
+      expect(s3Mounts[1].bucket).toEqual(bucket);
+      expect(s3Mounts[1].prefix).toEqual(`${prefix}/${myStudyId}/`);
+      expect(s3Mounts[1].writeable).toEqual(true);
+      expect(s3Mounts[1].kmsKeyId).toEqual(kmsKeyArn);
+
+      expect(s3Mounts[2].id).toEqual(openDataStudyId);
+      expect(s3Mounts[2].bucket).toEqual(bucket);
+      expect(s3Mounts[2].prefix).toEqual(`${prefix}/${openDataStudyId}/`);
+      expect(s3Mounts[2].writeable).toEqual(false);
+      expect(s3Mounts[2].kmsKeyId).toBeUndefined(); // kmsKeyId should not be set for open data studies
+    });
   });
 
   describe('Update paths', () => {
@@ -107,11 +210,7 @@ describe('EnvironmentMountService', () => {
       await service.applyWorkspacePermissions(studyId, updateRequest);
 
       // CHECK
-      expect(service.addPermissions).toHaveBeenCalledWith(
-        [{ uid: 'User1-UID', permissionLevel: 'readonly' }],
-        studyId,
-        updateRequest,
-      );
+      expect(service.addPermissions).toHaveBeenCalledWith([{ uid: 'User1-UID', permissionLevel: 'readonly' }], studyId);
       expect(service.removePermissions).not.toHaveBeenCalled();
       expect(service.updatePermissions).not.toHaveBeenCalled();
     });
@@ -634,7 +733,14 @@ describe('EnvironmentMountService', () => {
           {
             Sid: 'S3StudyReadWriteAccess',
             Effect: 'Allow',
-            Action: ['s3:GetObject', 's3:PutObject', 's3:PutObjectAcl'],
+            Action: [
+              's3:GetObject',
+              's3:AbortMultipartUpload',
+              's3:ListMultipartUploadParts',
+              's3:PutObject',
+              's3:PutObjectAcl',
+              's3:DeleteObject',
+            ],
             Resource: [`${studyBucket}/${studyPrefix}`],
           },
         ],
@@ -695,7 +801,14 @@ describe('EnvironmentMountService', () => {
           {
             Sid: 'S3StudyReadWriteAccess',
             Effect: 'Allow',
-            Action: ['s3:GetObject', 's3:PutObject', 's3:PutObjectAcl'],
+            Action: [
+              's3:GetObject',
+              's3:AbortMultipartUpload',
+              's3:ListMultipartUploadParts',
+              's3:PutObject',
+              's3:PutObjectAcl',
+              's3:DeleteObject',
+            ],
             Resource: ['StudyBucketPath_XYZ'],
           },
         ],
@@ -736,7 +849,14 @@ describe('EnvironmentMountService', () => {
           {
             Sid: 'S3StudyReadWriteAccess',
             Effect: 'Allow',
-            Action: ['s3:GetObject', 's3:PutObject', 's3:PutObjectAcl'],
+            Action: [
+              's3:GetObject',
+              's3:AbortMultipartUpload',
+              's3:ListMultipartUploadParts',
+              's3:PutObject',
+              's3:PutObjectAcl',
+              's3:DeleteObject',
+            ],
             Resource: ['StudyBucketPath_XYZ', `${studyBucket}/${studyPrefix}`],
           },
         ],
@@ -882,7 +1002,14 @@ describe('EnvironmentMountService', () => {
         {
           Sid: 'S3StudyReadWriteAccess',
           Effect: 'Allow',
-          Action: ['s3:GetObject', 's3:PutObject', 's3:PutObjectAcl'],
+          Action: [
+            's3:GetObject',
+            's3:AbortMultipartUpload',
+            's3:ListMultipartUploadParts',
+            's3:PutObject',
+            's3:PutObjectAcl',
+            's3:DeleteObject',
+          ],
           Resource: ['AnotherStudyBucketPath', `${studyBucket}/${studyPrefix}`],
         },
       ],
@@ -917,7 +1044,14 @@ describe('EnvironmentMountService', () => {
         {
           Sid: 'S3StudyReadWriteAccess',
           Effect: 'Allow',
-          Action: ['s3:GetObject', 's3:PutObject', 's3:PutObjectAcl'],
+          Action: [
+            's3:GetObject',
+            's3:AbortMultipartUpload',
+            's3:ListMultipartUploadParts',
+            's3:PutObject',
+            's3:PutObjectAcl',
+            's3:DeleteObject',
+          ],
           Resource: ['AnotherStudyBucketPath'],
         },
         {
@@ -1022,7 +1156,14 @@ describe('EnvironmentMountService', () => {
         {
           Sid: 'S3StudyReadWriteAccess',
           Effect: 'Allow',
-          Action: ['s3:GetObject', 's3:PutObject', 's3:PutObjectAcl'],
+          Action: [
+            's3:GetObject',
+            's3:AbortMultipartUpload',
+            's3:ListMultipartUploadParts',
+            's3:PutObject',
+            's3:PutObjectAcl',
+            's3:DeleteObject',
+          ],
           Resource: [`${studyBucket}/${studyPrefix}`],
         },
       ],
@@ -1134,6 +1275,108 @@ describe('EnvironmentMountService', () => {
     expect(IamUpdateParams.policyDoc).toMatchObject(expectedPolicy);
   });
 
+  it('should ensure duplicate resources are not created for non-admins after permission addition from a bad state', async () => {
+    // BUILD
+    const updateRequest = {
+      usersToAdd: [{ uid: 'User1-UID', permissionLevel: 'readwrite' }],
+    };
+    const studyId = 'StudyA';
+    const envsForUser = [{ studyIds: ['StudyA'] }];
+    environmentScService.getActiveEnvsForUser = jest.fn().mockResolvedValue(envsForUser);
+    iamService.putRolePolicy = jest.fn();
+    const studyBucket = 'arn:aws:s3:::xxxxxxxx-namespace-studydata';
+    const studyPrefix = 'studies/Organization/SampleStudy/*';
+    const inputPolicy = {
+      Version: '2012-10-17',
+      Statement: [
+        {
+          Sid: 'studyKMSAccess',
+          Action: ['Permission1', 'Permission2'],
+          Effect: 'Allow',
+          Resource: 'arn:aws:kms:region:xxxxxxxx:key/someRandomString',
+        },
+        {
+          Sid: 'studyListS3AccessN',
+          Effect: 'Allow',
+          Action: 's3:ListBucket',
+          Resource: studyBucket,
+          Condition: {
+            StringLike: {
+              's3:prefix': ['AnotherStudyPrefixForThisBucket', studyPrefix],
+            },
+          },
+        },
+        {
+          Sid: 'S3StudyReadAccess',
+          Effect: 'Allow',
+          Action: ['s3:GetObject'],
+          Resource: ['AnotherStudyBucketPath', `${studyBucket}/${studyPrefix}`],
+        },
+      ],
+    };
+    const IamUpdateParams = {
+      iamClient: 'sampleIamClient',
+      studyPathArn: `${studyBucket}/${studyPrefix}`,
+      policyDoc: inputPolicy,
+      roleName: 'sampleRoleName',
+      studyDataPolicyName: 'sampleStudyDataPolicy',
+    };
+    const expectedPolicy = {
+      Version: '2012-10-17',
+      Statement: [
+        {
+          Sid: 'studyKMSAccess',
+          Action: ['Permission1', 'Permission2'],
+          Effect: 'Allow',
+          Resource: 'arn:aws:kms:region:xxxxxxxx:key/someRandomString',
+        },
+        {
+          Sid: 'studyListS3AccessN',
+          Effect: 'Allow',
+          Action: 's3:ListBucket',
+          Resource: studyBucket,
+          Condition: {
+            StringLike: {
+              's3:prefix': ['AnotherStudyPrefixForThisBucket', studyPrefix],
+            },
+          },
+        },
+        {
+          Sid: 'S3StudyReadAccess',
+          Effect: 'Allow',
+          Action: ['s3:GetObject'],
+          Resource: ['AnotherStudyBucketPath'],
+        },
+        {
+          Sid: 'S3StudyReadWriteAccess',
+          Effect: 'Allow',
+          Action: [
+            's3:GetObject',
+            's3:AbortMultipartUpload',
+            's3:ListMultipartUploadParts',
+            's3:PutObject',
+            's3:PutObjectAcl',
+            's3:DeleteObject',
+          ],
+          Resource: [`${studyBucket}/${studyPrefix}`],
+        },
+      ],
+    };
+    service._getIamUpdateParams = jest.fn().mockResolvedValue(IamUpdateParams);
+
+    // OPERATE
+    await service.applyWorkspacePermissions(studyId, updateRequest);
+
+    // CHECK
+    expect(iamService.putRolePolicy).toHaveBeenCalledWith(
+      IamUpdateParams.roleName,
+      IamUpdateParams.studyDataPolicyName,
+      JSON.stringify(IamUpdateParams.policyDoc),
+      IamUpdateParams.iamClient,
+    );
+    expect(IamUpdateParams.policyDoc).toMatchObject(expectedPolicy);
+  });
+
   it('should ensure permission updates for admins are as expected', async () => {
     // BUILD
     const updateRequest = {
@@ -1172,7 +1415,14 @@ describe('EnvironmentMountService', () => {
         {
           Sid: 'S3StudyReadWriteAccess',
           Effect: 'Allow',
-          Action: ['s3:GetObject', 's3:PutObject', 's3:PutObjectAcl'],
+          Action: [
+            's3:GetObject',
+            's3:AbortMultipartUpload',
+            's3:ListMultipartUploadParts',
+            's3:PutObject',
+            's3:PutObjectAcl',
+            's3:DeleteObject',
+          ],
           Resource: [`${studyBucket}/${studyPrefix}`],
         },
         {
@@ -1215,6 +1465,109 @@ describe('EnvironmentMountService', () => {
           Effect: 'Allow',
           Action: ['s3:GetObject'],
           Resource: ['AnotherStudyBucketPath', `${studyBucket}/${studyPrefix}`],
+        },
+      ],
+    };
+    service._getIamUpdateParams = jest.fn().mockResolvedValue(IamUpdateParams);
+
+    // OPERATE
+    await service.applyWorkspacePermissions(studyId, updateRequest);
+
+    // CHECK
+    expect(iamService.putRolePolicy).toHaveBeenCalledWith(
+      IamUpdateParams.roleName,
+      IamUpdateParams.studyDataPolicyName,
+      JSON.stringify(IamUpdateParams.policyDoc),
+      IamUpdateParams.iamClient,
+    );
+    expect(IamUpdateParams.policyDoc).toMatchObject(expectedPolicy);
+  });
+
+  it('should ensure permission updates when admins are removed are as expected', async () => {
+    // BUILD
+    const updateRequest = {
+      usersToAdd: [{ uid: 'User1-UID', permissionLevel: 'readwrite' }],
+      usersToRemove: [{ uid: 'User1-UID', permissionLevel: 'admin' }],
+    };
+    const studyId = 'StudyA';
+    const envsForUser = [{ studyIds: ['StudyA'] }];
+    environmentScService.getActiveEnvsForUser = jest.fn().mockResolvedValue(envsForUser);
+    iamService.putRolePolicy = jest.fn();
+    const studyBucket = 'arn:aws:s3:::xxxxxxxx-namespace-studydata';
+    const studyPrefix = 'studies/Organization/SampleStudy/*';
+    const inputPolicy = {
+      Version: '2012-10-17',
+      Statement: [
+        {
+          Sid: 'studyKMSAccess',
+          Action: ['Permission1', 'Permission2'],
+          Effect: 'Allow',
+          Resource: 'arn:aws:kms:region:xxxxxxxx:key/someRandomString',
+        },
+        {
+          Sid: 'studyListS3AccessN',
+          Effect: 'Allow',
+          Action: 's3:ListBucket',
+          Resource: studyBucket,
+          Condition: {
+            StringLike: {
+              's3:prefix': ['AnotherStudyPrefixForThisBucket', studyPrefix],
+            },
+          },
+        },
+        {
+          Sid: 'S3StudyReadAccess',
+          Effect: 'Allow',
+          Action: ['s3:GetObject'],
+          Resource: ['AnotherStudyBucketPath', `${studyBucket}/${studyPrefix}`],
+        },
+      ],
+    };
+    const IamUpdateParams = {
+      iamClient: 'sampleIamClient',
+      studyPathArn: `${studyBucket}/${studyPrefix}`,
+      policyDoc: inputPolicy,
+      roleName: 'sampleRoleName',
+      studyDataPolicyName: 'sampleStudyDataPolicy',
+    };
+    const expectedPolicy = {
+      Version: '2012-10-17',
+      Statement: [
+        {
+          Sid: 'studyKMSAccess',
+          Action: ['Permission1', 'Permission2'],
+          Effect: 'Allow',
+          Resource: 'arn:aws:kms:region:xxxxxxxx:key/someRandomString',
+        },
+        {
+          Sid: 'studyListS3AccessN',
+          Effect: 'Allow',
+          Action: 's3:ListBucket',
+          Resource: studyBucket,
+          Condition: {
+            StringLike: {
+              's3:prefix': ['AnotherStudyPrefixForThisBucket', studyPrefix],
+            },
+          },
+        },
+        {
+          Sid: 'S3StudyReadAccess',
+          Effect: 'Allow',
+          Action: ['s3:GetObject'],
+          Resource: ['AnotherStudyBucketPath'],
+        },
+        {
+          Sid: 'S3StudyReadWriteAccess',
+          Effect: 'Allow',
+          Action: [
+            's3:GetObject',
+            's3:AbortMultipartUpload',
+            's3:ListMultipartUploadParts',
+            's3:PutObject',
+            's3:PutObjectAcl',
+            's3:DeleteObject',
+          ],
+          Resource: [`${studyBucket}/${studyPrefix}`],
         },
       ],
     };
